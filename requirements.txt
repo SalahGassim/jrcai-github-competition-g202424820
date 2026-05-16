@@ -1,0 +1,7 @@
+numpy>=1.24
+scipy>=1.10
+opencv-python>=4.7
+h5py>=3.8
+matplotlib>=3.7
+tqdm>=4.65
+pyproj>=3.5
