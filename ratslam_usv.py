@@ -720,7 +720,14 @@ def _probe_h5(h5: h5py.File) -> None:
 
     def _visitor(name, obj):
         if isinstance(obj, h5py.Dataset):
-            print(f"  /{name:40s} shape={obj.shape}  dtype={obj.dtype}")
+            dt = obj.dtype
+            if dt.names:  # compound / structured dtype — print each field on its own line
+                print(f"  /{name}  shape={obj.shape}  (compound dtype, {len(dt.names)} fields)")
+                for fname in dt.names:
+                    fdtype = dt.fields[fname][0]
+                    print(f"      {fname!r:50s} {fdtype}")
+            else:
+                print(f"  /{name:40s} shape={obj.shape}  dtype={dt}")
 
     h5.visititems(_visitor)
     print("===========================\n")
@@ -837,6 +844,233 @@ class HDF5DataLoader:
                 img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
 
             yield i, img, odom_vec, t
+
+
+# ---------------------------------------------------------------------------
+# 5b. Compound HDF5 Data Loader  (single /data dataset, one row per timestep)
+# ---------------------------------------------------------------------------
+
+# Required field names inside the compound dtype
+_COMPOUND_REQUIRED = [
+    "Image",
+    "Latitude",
+    "Longitude",
+    "Heading (degrees Magnetic)",
+    "Yaw rate [degrees/s]",
+    "Time",
+]
+
+
+class CompoundHDF5DataLoader:
+    """
+    Loader for HDF5 files whose entire payload lives in a single compound
+    dataset (e.g. /data, shape (N,)) where every row contains all modalities
+    already aligned to one timestep.
+
+    Implements the same interface as HDF5DataLoader:
+      __enter__ / __exit__, num_frames, gps_enu(), iterate()
+    """
+
+    def __init__(self, path: str, args: argparse.Namespace):
+        self.path = path
+        self.args = args
+        self._h5: Optional[h5py.File] = None
+        self._ds = None          # the compound dataset object
+        self._lat0: Optional[float] = None
+        self._lon0: Optional[float] = None
+        self._valid_mask: Optional[np.ndarray] = None  # (N,) bool — valid GPS rows
+
+    # ------------------------------------------------------------------
+    def __enter__(self):
+        self._h5 = h5py.File(self.path, "r")
+        _probe_h5(self._h5)
+        self._locate_and_validate()
+        return self
+
+    def __exit__(self, *_):
+        if self._h5:
+            self._h5.close()
+
+    def _locate_and_validate(self) -> None:
+        data_key = getattr(self.args, "data_key", "/data")
+        if data_key not in self._h5:
+            available = []
+            self._h5.visititems(
+                lambda n, o: available.append(f"/{n}") if isinstance(o, h5py.Dataset) else None
+            )
+            raise KeyError(
+                f"Compound dataset '{data_key}' not found in {self.path}.\n"
+                f"Available datasets: {available}\n"
+                f"Use --data-key to specify the correct path."
+            )
+
+        self._ds = self._h5[data_key]
+        dt = self._ds.dtype
+
+        if not dt.names:
+            raise TypeError(
+                f"Dataset '{data_key}' does not have a compound/structured dtype "
+                f"(got {dt}). Use the standard --img-key / --odom-pose loader instead."
+            )
+
+        missing = [f for f in _COMPOUND_REQUIRED if f not in dt.names]
+        if missing:
+            raise KeyError(
+                f"The compound dataset '{data_key}' is missing required fields: {missing}\n"
+                f"Available fields: {list(dt.names)}"
+            )
+
+        print(f"[CompoundLoader] Dataset: '{data_key}'  rows={self._ds.shape[0]}")
+        print(f"[CompoundLoader] Odometry source: {getattr(self.args, 'odom_source', 'gps_pose')}")
+
+        # --- odom_source=gps_pose warning ---
+        odom_source = getattr(self.args, "odom_source", "gps_pose")
+        if odom_source == "gps_pose":
+            print(
+                "[CompoundLoader] WARNING: --odom-source=gps_pose derives odometry directly "
+                "from GPS.\n"
+                "  The estimated trajectory will closely mirror GPS ground truth, making the\n"
+                "  Hausdorff comparison non-informative. Use this mode only to verify the\n"
+                "  pipeline runs end-to-end, then switch to --odom-source imu_yaw_gps_speed."
+            )
+
+        # --- Time field sanity check (req. 7) ---
+        times = self._ds["Time"][:5]
+        print(f"\n[CompoundLoader] First 5 'Time' values: {times.tolist()}")
+        if len(times) > 1:
+            dts = [float(times[i + 1]) - float(times[i]) for i in range(len(times) - 1)]
+            print(f"[CompoundLoader] First {len(dts)} dt values: {[f'{d:.3f}' for d in dts]}")
+        print()
+
+        # --- GPS validity mask (build once; reused by gps_enu and iterate) ---
+        lats = self._ds["Latitude"][:]
+        lons = self._ds["Longitude"][:]
+        self._valid_mask = (
+            np.isfinite(lats) & np.isfinite(lons) &
+            ~((lats == 0.0) & (lons == 0.0))
+        )
+        first_valid = np.argmax(self._valid_mask)
+        if not self._valid_mask[first_valid]:
+            print("[CompoundLoader] WARNING: No valid GPS fixes found — GPS ENU unavailable.")
+            self._lat0 = None
+            self._lon0 = None
+        else:
+            self._lat0 = float(lats[first_valid])
+            self._lon0 = float(lons[first_valid])
+            print(f"[CompoundLoader] ENU origin: lat={self._lat0:.6f}, lon={self._lon0:.6f} "
+                  f"(row {first_valid})")
+
+        # --- Image crop sanity check (req. 6) ---
+        first_img = np.asarray(self._ds["Image"][0], dtype=np.uint8)
+        H, W = first_img.shape[:2]
+        cx_max = self.args.image_crop_x_max
+        cy_max = self.args.image_crop_y_max
+        if cx_max > W or cy_max > H:
+            # Compute a sensible suggestion from actual dimensions
+            sx_min = W // 8
+            sx_max = W - W // 8
+            sy_min = H // 4
+            sy_max = H - H // 4
+            print(
+                f"[CompoundLoader] WARNING: crop bounds (x_max={cx_max}, y_max={cy_max}) "
+                f"exceed image size {W}×{H}.\n"
+                f"  Suggested values for {W}×{H} images:\n"
+                f"    --image-crop-x-min {sx_min} --image-crop-x-max {sx_max} "
+                f"--image-crop-y-min {sy_min} --image-crop-y-max {sy_max}"
+            )
+
+    # ------------------------------------------------------------------
+    @property
+    def num_frames(self) -> int:
+        return self._ds.shape[0]
+
+    def gps_enu(self) -> Optional[np.ndarray]:
+        """Return (N, 2) ENU array; rows where GPS is invalid contain NaN."""
+        if self._lat0 is None:
+            return None
+        lats = self._ds["Latitude"][:]
+        lons = self._ds["Longitude"][:]
+        enu = np.full((len(lats), 2), np.nan, dtype=np.float64)
+        for i in np.where(self._valid_mask)[0]:
+            enu[i] = gps_to_enu(float(lats[i]), float(lons[i]), self._lat0, self._lon0)
+        return enu
+
+    def iterate(self,
+                max_frames: Optional[int] = None
+                ) -> Iterator[Tuple[int, np.ndarray, np.ndarray, float]]:
+        """
+        Yield (frame_idx, image_uint8, odom_vec, timestamp) in row order.
+        odom_vec shape depends on --odom-source:
+          gps_pose          → (3,)  [east, north, theta_rad]
+          imu_yaw_gps_speed → (2,)  [v_m_s, omega_rad_s]
+          imu_only          → (2,)  [v_m_s, omega_rad_s]
+        """
+        odom_source = getattr(self.args, "odom_source", "gps_pose")
+        n = self.num_frames
+        if max_frames:
+            n = min(n, max_frames)
+
+        prev_time: Optional[float] = None
+        prev_enu: Optional[Tuple[float, float]] = None  # for imu_yaw_gps_speed
+        integrated_v: float = 0.0                       # for imu_only
+
+        for i in range(n):
+            row = self._ds[i]
+
+            # --- timestamp & dt ---
+            t = float(row["Time"])
+            if prev_time is None or (t - prev_time) <= 0:
+                dt = 1.0
+            else:
+                dt = t - prev_time
+            prev_time = t
+
+            # --- image ---
+            image = np.asarray(row["Image"], dtype=np.uint8)
+
+            # --- heading: compass bearing (CW from N) → math angle (CCW from E) ---
+            heading_deg = float(row["Heading (degrees Magnetic)"])
+            theta = math.radians(90.0 - heading_deg)
+
+            # --- yaw rate ---
+            yaw_rate_deg_s = float(row["Yaw rate [degrees/s]"])
+            omega = math.radians(yaw_rate_deg_s)
+
+            # --- build odometry vector ---
+            if odom_source == "gps_pose":
+                lat = float(row["Latitude"])
+                lon = float(row["Longitude"])
+                if self._lat0 is not None and self._valid_mask[i]:
+                    east, north = gps_to_enu(lat, lon, self._lat0, self._lon0)
+                else:
+                    east, north = (0.0, 0.0) if prev_enu is None else prev_enu
+                odom_vec = np.array([east, north, theta], dtype=np.float64)
+
+            elif odom_source == "imu_yaw_gps_speed":
+                lat = float(row["Latitude"])
+                lon = float(row["Longitude"])
+                if self._lat0 is not None and self._valid_mask[i]:
+                    east, north = gps_to_enu(lat, lon, self._lat0, self._lon0)
+                    if prev_enu is not None:
+                        de = east - prev_enu[0]
+                        dn = north - prev_enu[1]
+                        v = math.sqrt(de**2 + dn**2) / max(dt, 1e-6)
+                    else:
+                        v = 0.0
+                    prev_enu = (east, north)
+                else:
+                    v = 0.0  # no valid GPS — coast
+                odom_vec = np.array([v, omega], dtype=np.float64)
+
+            else:  # imu_only
+                # Integrate forward acceleration (drifts without zero-velocity update)
+                accel_x_g = float(row["Acceleration x, forward (G)"])
+                accel_x_ms2 = accel_x_g * 9.80665
+                integrated_v += accel_x_ms2 * dt
+                integrated_v = max(0.0, integrated_v)  # clamp: USV can't go backwards easily
+                odom_vec = np.array([integrated_v, omega], dtype=np.float64)
+
+            yield i, image, odom_vec, t
 
 
 # ---------------------------------------------------------------------------
@@ -1067,7 +1301,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-frames", type=int, default=None,
                    help="Stop after N frames (for quick tests)")
 
-    # HDF5 field overrides
+    # Compound-dataset loader (alternative to the default multi-stream loader)
+    p.add_argument("--compound", action="store_true",
+                   help="Use CompoundHDF5DataLoader (single compound dataset per row)")
+    p.add_argument("--data-key", default="/data",
+                   help="HDF5 path for the compound dataset (default: /data)")
+    p.add_argument("--odom-source",
+                   choices=["gps_pose", "imu_yaw_gps_speed", "imu_only"],
+                   default="gps_pose",
+                   help=("Odometry source for CompoundHDF5DataLoader. "
+                         "gps_pose=sanity-check only (GPS→pose, Hausdorff meaningless); "
+                         "imu_yaw_gps_speed=twist [v,ω] from GPS speed + IMU yaw; "
+                         "imu_only=twist from integrated accel (drifts without ZUPT). "
+                         "Default: gps_pose"))
+
+    # HDF5 field overrides (standard multi-stream loader)
     p.add_argument("--img-key",    default=None, help="HDF5 path for images")
     p.add_argument("--img-ts",     default=None, help="HDF5 path for image timestamps")
     p.add_argument("--odom-pose",  default=None, help="HDF5 path for pose odometry [x,y,th]")
@@ -1125,13 +1373,18 @@ def main() -> None:
     if args.probe:
         with h5py.File(args.input, "r") as h5:
             _probe_h5(h5)
-        print("Use --img-key, --odom-pose (or --odom-twist), etc. to override field names.")
+        if args.compound:
+            print("Compound-dataset mode. Use --data-key to override the dataset path.")
+        else:
+            print("Use --img-key, --odom-pose (or --odom-twist), etc. to override field names.")
+            print("Pass --compound to use the single-dataset compound loader instead.")
         sys.exit(0)
 
     # Initialise components
     rat = RatSLAM(args)
 
-    with HDF5DataLoader(args.input, args) as loader:
+    Loader = CompoundHDF5DataLoader if args.compound else HDF5DataLoader
+    with Loader(args.input, args) as loader:
         n_frames = loader.num_frames
         if args.max_frames:
             n_frames = min(n_frames, args.max_frames)
