@@ -43,6 +43,15 @@ def gps_to_enu(lat: float, lon: float, lat0: float, lon0: float) -> Tuple[float,
     return east, north
 
 
+def _hhmmss_to_seconds(t: int) -> float:
+    """Convert HHMMSS-packed int (e.g. 125458 -> 12:54:58) to seconds since midnight."""
+    t = int(t)
+    h = t // 10000
+    m = (t // 100) % 100
+    s = t % 100
+    return h * 3600 + m * 60 + s
+
+
 def hausdorff(A: np.ndarray, B: np.ndarray) -> float:
     """Symmetric Hausdorff distance between two (N,2) arrays — Eq. (9)."""
     if len(A) == 0 or len(B) == 0:
@@ -935,11 +944,19 @@ class CompoundHDF5DataLoader:
             )
 
         # --- Time field sanity check (req. 7) ---
-        times = self._ds["Time"][:5]
-        print(f"\n[CompoundLoader] First 5 'Time' values: {times.tolist()}")
-        if len(times) > 1:
-            dts = [float(times[i + 1]) - float(times[i]) for i in range(len(times) - 1)]
-            print(f"[CompoundLoader] First {len(dts)} dt values: {[f'{d:.3f}' for d in dts]}")
+        times_raw = self._ds["Time"][:5]
+        times_sec = [_hhmmss_to_seconds(v) for v in times_raw]
+        print(f"\n[CompoundLoader] First 5 'Time' values (raw HHMMSS): {times_raw.tolist()}")
+        print(f"[CompoundLoader] First 5 'Time' values (seconds):    {times_sec}")
+        if len(times_sec) > 1:
+            dts = []
+            for i in range(len(times_sec) - 1):
+                d = times_sec[i + 1] - times_sec[i]
+                if d < 0:
+                    d += 86400.0   # midnight rollover
+                dts.append(d)
+            print(f"[CompoundLoader] First {len(dts)} dt values (seconds):        "
+                  f"{[f'{d:.3f}' for d in dts]}")
         print()
 
         # --- GPS validity mask (build once; reused by gps_enu and iterate) ---
@@ -1010,7 +1027,7 @@ class CompoundHDF5DataLoader:
         if max_frames:
             n = min(n, max_frames)
 
-        prev_time: Optional[float] = None
+        prev_t: Optional[float] = None
         prev_enu: Optional[Tuple[float, float]] = None  # for imu_yaw_gps_speed
         integrated_v: float = 0.0                       # for imu_only
 
@@ -1018,12 +1035,21 @@ class CompoundHDF5DataLoader:
             row = self._ds[i]
 
             # --- timestamp & dt ---
-            t = float(row["Time"])
-            if prev_time is None or (t - prev_time) <= 0:
+            # Time field is HHMMSS-packed (e.g. 125458 = 12:54:58); convert to seconds
+            # so that per-minute rollovers (125459→125500 = +41 raw, +1 real) don't
+            # corrupt dt-dependent odometry modes.
+            raw_t = int(row["Time"])
+            t = _hhmmss_to_seconds(raw_t)
+
+            if prev_t is None:
                 dt = 1.0
             else:
-                dt = t - prev_time
-            prev_time = t
+                dt = t - prev_t
+                if dt < 0:              # midnight rollover (23:59:59 -> 00:00:00)
+                    dt += 86400.0
+                if dt <= 0 or dt > 60.0:  # guard against bad/missing samples
+                    dt = 1.0
+            prev_t = t
 
             # --- image ---
             image = np.asarray(row["Image"], dtype=np.uint8)
@@ -1255,21 +1281,21 @@ class Visualizer:
 
         # Hausdorff report — Eq. (9)
         report_path = os.path.join(output_dir, "hausdorff_report.txt")
-        with open(report_path, "w") as f:
+        with open(report_path, "w", encoding="utf-8") as f:
             if gps_enu is not None and len(traj) > 1:
                 est_xy = traj[:, 1:3]
                 dh = hausdorff(gps_enu, est_xy)  # Eq. (9)
                 f.write(f"Symmetric Hausdorff distance dH: {dh:.4f} m\n")
                 dh_fwd = directed_hausdorff(gps_enu, est_xy)[0]
                 dh_rev = directed_hausdorff(est_xy, gps_enu)[0]
-                f.write(f"  Directed GPS→Est:  {dh_fwd:.4f} m\n")
-                f.write(f"  Directed Est→GPS:  {dh_rev:.4f} m\n")
+                f.write(f"  Directed GPS->Est:  {dh_fwd:.4f} m\n")
+                f.write(f"  Directed Est->GPS:  {dh_rev:.4f} m\n")
                 f.write("\nNote: paper reports ~8 m on 900 m loop.\n")
             else:
-                f.write("GPS ground truth not available — Hausdorff not computed.\n")
+                f.write("GPS ground truth not available - Hausdorff not computed.\n")
 
         print(f"\n[Output] Saved all results to: {output_dir}")
-        with open(report_path) as f:
+        with open(report_path, encoding="utf-8") as f:
             print(f.read())
 
     def close(self) -> None:
