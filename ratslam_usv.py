@@ -788,16 +788,44 @@ class HDF5DataLoader:
         self.gps_key  = _find_field(h5, _GPS_CANDS,        getattr(a, "gps_key",  None))
         self.gps_ts   = _find_field(h5, _GPS_TS_CANDS,     getattr(a, "gps_ts",   None))
 
-        assert self.img_key,  ("No camera image dataset found. "
-                               "Use --img-key to specify the path.")
-        assert self.img_ts,   ("No camera timestamp dataset found. "
-                               "Use --img-ts to specify the path.")
+        if not self.img_key:
+            # Before generic failure, check whether this is a compound-layout file
+            compound_hint = None
+            def _v(name, obj):
+                nonlocal compound_hint
+                if (isinstance(obj, h5py.Dataset)
+                        and obj.dtype.names
+                        and "Image" in obj.dtype.names
+                        and compound_hint is None):
+                    compound_hint = "/" + name
+            self._h5.visititems(_v)
+            if compound_hint is not None:
+                raise RuntimeError(
+                    f"This file uses a compound layout (dataset '{compound_hint}' "
+                    f"has an 'Image' field), not the per-stream layout this loader "
+                    f"expects. Re-run with --compound "
+                    f"(and --data-key {compound_hint} if it is not /data)."
+                )
+            raise AssertionError(
+                "No camera image dataset found. Use --img-key to specify the path, "
+                "or --compound if your file packs everything into one compound dataset."
+            )
+
+        if not self.img_ts:
+            raise AssertionError(
+                "No camera timestamp dataset found. Use --img-ts to specify the path."
+            )
 
         odom_key = self.odom_pose or self.odom_twist
-        assert odom_key, ("No odometry dataset found (tried pose and twist). "
-                          "Use --odom-pose or --odom-twist to specify.")
-        assert self.odom_ts, ("No odometry timestamp dataset found. "
-                              "Use --odom-ts to specify.")
+        if not odom_key:
+            raise AssertionError(
+                "No odometry dataset found (tried pose and twist). "
+                "Use --odom-pose or --odom-twist to specify."
+            )
+        if not self.odom_ts:
+            raise AssertionError(
+                "No odometry timestamp dataset found. Use --odom-ts to specify."
+            )
 
         self._odom_key = odom_key
         self._use_twist = (odom_key == self.odom_twist)
@@ -1387,6 +1415,23 @@ def build_parser() -> argparse.ArgumentParser:
 # 8. Main
 # ---------------------------------------------------------------------------
 
+def _detect_compound(path: str) -> Optional[str]:
+    """Return the HDF5 path of the first compound dataset with an 'Image' field, or None."""
+    try:
+        with h5py.File(path, "r") as h5:
+            found = [None]
+            def _visit(name, obj):
+                if (isinstance(obj, h5py.Dataset)
+                        and obj.dtype.names
+                        and "Image" in obj.dtype.names
+                        and found[0] is None):
+                    found[0] = "/" + name
+            h5.visititems(_visit)
+            return found[0]
+    except Exception:
+        return None  # let the loader produce its own error
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -1409,7 +1454,21 @@ def main() -> None:
     # Initialise components
     rat = RatSLAM(args)
 
-    Loader = CompoundHDF5DataLoader if args.compound else HDF5DataLoader
+    if args.compound:
+        Loader = CompoundHDF5DataLoader
+    else:
+        detected = _detect_compound(args.input)
+        if detected is not None:
+            print(f"[main] Detected compound dataset at '{detected}' with an 'Image' "
+                  f"field — auto-enabling compound loader. "
+                  f"(Pass --compound explicitly to silence this notice.)")
+            args.compound = True
+            if args.data_key == "/data":
+                args.data_key = detected
+            Loader = CompoundHDF5DataLoader
+        else:
+            Loader = HDF5DataLoader
+
     with Loader(args.input, args) as loader:
         n_frames = loader.num_frames
         if args.max_frames:
