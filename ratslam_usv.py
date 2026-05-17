@@ -916,6 +916,7 @@ class CompoundHDF5DataLoader:
         self._lat0: Optional[float] = None
         self._lon0: Optional[float] = None
         self._valid_mask: Optional[np.ndarray] = None  # (N,) bool — valid GPS rows
+        self._skipped_frames: int = 0
 
     # ------------------------------------------------------------------
     def __enter__(self):
@@ -925,6 +926,8 @@ class CompoundHDF5DataLoader:
         return self
 
     def __exit__(self, *_):
+        if self._skipped_frames:
+            print(f"[CompoundLoader] Skipped {self._skipped_frames} frame(s) due to invalid GPS.")
         if self._h5:
             self._h5.close()
 
@@ -990,39 +993,79 @@ class CompoundHDF5DataLoader:
         # --- GPS validity mask (build once; reused by gps_enu and iterate) ---
         lats = self._ds["Latitude"][:]
         lons = self._ds["Longitude"][:]
-        self._valid_mask = (
-            np.isfinite(lats) & np.isfinite(lons) &
-            ~((lats == 0.0) & (lons == 0.0))
-        )
-        first_valid = np.argmax(self._valid_mask)
-        if not self._valid_mask[first_valid]:
+        total = len(lats)
+        gps_max_step = getattr(self.args, "gps_max_step", 50.0)
+
+        # Pass 1: per-row scalar filters
+        finite_mask = np.isfinite(lats) & np.isfinite(lons)
+        # Either lat==0 OR lon==0 is invalid (equator/prime meridian never valid for USV)
+        zero_mask   = (lats == 0.0) | (lons == 0.0)
+        range_mask  = (np.abs(lats) > 90.0) | (np.abs(lons) > 180.0)
+        pre_mask    = finite_mask & ~zero_mask & ~range_mask
+
+        n_zero  = int(np.sum(finite_mask & zero_mask))
+        n_range = int(np.sum(finite_mask & ~zero_mask & range_mask))
+
+        first_valid_idx = int(np.argmax(pre_mask)) if pre_mask.any() else -1
+        if first_valid_idx < 0 or not pre_mask[first_valid_idx]:
             print("[CompoundLoader] WARNING: No valid GPS fixes found — GPS ENU unavailable.")
             self._lat0 = None
             self._lon0 = None
+            self._valid_mask = pre_mask
+            print(f"[CompoundLoader] GPS: 0 valid / {total} total "
+                  f"(rejected: zero={n_zero}, out_of_range={n_range}, teleport=0)")
         else:
-            self._lat0 = float(lats[first_valid])
-            self._lon0 = float(lons[first_valid])
-            print(f"[CompoundLoader] ENU origin: lat={self._lat0:.6f}, lon={self._lon0:.6f} "
-                  f"(row {first_valid})")
+            self._lat0 = float(lats[first_valid_idx])
+            self._lon0 = float(lons[first_valid_idx])
 
-        # --- Image crop sanity check (req. 6) ---
+            # Pass 2: teleport rejection in ENU space — walk valid points in order
+            valid_mask = pre_mask.copy()
+            prev_e: Optional[float] = None
+            prev_n: Optional[float] = None
+            n_teleport = 0
+            for i in range(total):
+                if not pre_mask[i]:
+                    continue
+                e, n = gps_to_enu(float(lats[i]), float(lons[i]), self._lat0, self._lon0)
+                if prev_e is not None:
+                    step = math.sqrt((e - prev_e) ** 2 + (n - prev_n) ** 2)
+                    if step > gps_max_step:
+                        valid_mask[i] = False
+                        n_teleport += 1
+                        continue  # don't update prev_e/n from a rejected point
+                prev_e, prev_n = e, n
+
+            self._valid_mask = valid_mask
+            n_valid = int(valid_mask.sum())
+            print(f"[CompoundLoader] ENU origin: lat={self._lat0:.6f}, lon={self._lon0:.6f} "
+                  f"(row {first_valid_idx})")
+            print(f"[CompoundLoader] GPS: {n_valid} valid / {total} total "
+                  f"(rejected: zero={n_zero}, out_of_range={n_range}, teleport={n_teleport})")
+
+        # --- Image crop sanity check + coverage summary ---
         first_img = np.asarray(self._ds["Image"][0], dtype=np.uint8)
         H, W = first_img.shape[:2]
+        cx_min = self.args.image_crop_x_min
         cx_max = self.args.image_crop_x_max
+        cy_min = self.args.image_crop_y_min
         cy_max = self.args.image_crop_y_max
         if cx_max > W or cy_max > H:
-            # Compute a sensible suggestion from actual dimensions
             sx_min = W // 8
             sx_max = W - W // 8
             sy_min = H // 4
             sy_max = H - H // 4
             print(
                 f"[CompoundLoader] WARNING: crop bounds (x_max={cx_max}, y_max={cy_max}) "
-                f"exceed image size {W}×{H}.\n"
-                f"  Suggested values for {W}×{H} images:\n"
+                f"exceed image size {W}x{H}.\n"
+                f"  Suggested values for {W}x{H} images:\n"
                 f"    --image-crop-x-min {sx_min} --image-crop-x-max {sx_max} "
                 f"--image-crop-y-min {sy_min} --image-crop-y-max {sy_max}"
             )
+        crop_w = max(0, min(cx_max, W) - max(cx_min, 0))
+        crop_h = max(0, min(cy_max, H) - max(cy_min, 0))
+        print(f"[CompoundLoader] Crop covers {crop_w * 100 // W}% of frame width, "
+              f"{crop_h * 100 // H}% of frame height "
+              f"(crop={crop_w}x{crop_h} of {W}x{H})")
 
     # ------------------------------------------------------------------
     @property
@@ -1092,28 +1135,30 @@ class CompoundHDF5DataLoader:
 
             # --- build odometry vector ---
             if odom_source == "gps_pose":
-                lat = float(row["Latitude"])
-                lon = float(row["Longitude"])
-                if self._lat0 is not None and self._valid_mask[i]:
-                    east, north = gps_to_enu(lat, lon, self._lat0, self._lon0)
-                else:
-                    east, north = (0.0, 0.0) if prev_enu is None else prev_enu
+                # Skip frames with no valid GPS — a bad fix would produce a
+                # multi-million-metre raw_dx that permanently smears the PCN bump.
+                if self._lat0 is None or not self._valid_mask[i]:
+                    self._skipped_frames += 1
+                    continue
+                east, north = gps_to_enu(float(row["Latitude"]), float(row["Longitude"]),
+                                         self._lat0, self._lon0)
                 odom_vec = np.array([east, north, theta], dtype=np.float64)
 
             elif odom_source == "imu_yaw_gps_speed":
-                lat = float(row["Latitude"])
-                lon = float(row["Longitude"])
-                if self._lat0 is not None and self._valid_mask[i]:
-                    east, north = gps_to_enu(lat, lon, self._lat0, self._lon0)
-                    if prev_enu is not None:
-                        de = east - prev_enu[0]
-                        dn = north - prev_enu[1]
-                        v = math.sqrt(de**2 + dn**2) / max(dt, 1e-6)
-                    else:
-                        v = 0.0
-                    prev_enu = (east, north)
+                # Skip frames with no valid GPS — speed derived from a bad fix is
+                # meaningless; the frame gap is negligible at 1 Hz.
+                if self._lat0 is None or not self._valid_mask[i]:
+                    self._skipped_frames += 1
+                    continue
+                east, north = gps_to_enu(float(row["Latitude"]), float(row["Longitude"]),
+                                         self._lat0, self._lon0)
+                if prev_enu is not None:
+                    de = east - prev_enu[0]
+                    dn = north - prev_enu[1]
+                    v = math.sqrt(de**2 + dn**2) / max(dt, 1e-6)
                 else:
-                    v = 0.0  # no valid GPS — coast
+                    v = 0.0
+                prev_enu = (east, north)
                 odom_vec = np.array([v, omega], dtype=np.float64)
 
             else:  # imu_only
@@ -1130,6 +1175,19 @@ class CompoundHDF5DataLoader:
 # ---------------------------------------------------------------------------
 # 6. Visualiser
 # ---------------------------------------------------------------------------
+
+def _robust_extent(pts: np.ndarray, pct: float = 99.5, pad: float = 5.0):
+    """Return (xmin, xmax, ymin, ymax) clipped to the pct-th percentile + padding, or None."""
+    if pts is None or len(pts) == 0:
+        return None
+    x = pts[:, 0][np.isfinite(pts[:, 0])]
+    y = pts[:, 1][np.isfinite(pts[:, 1])]
+    if len(x) == 0 or len(y) == 0:
+        return None
+    lo = 100.0 - pct
+    return (np.percentile(x, lo) - pad, np.percentile(x, pct) + pad,
+            np.percentile(y, lo) - pad, np.percentile(y, pct) + pad)
+
 
 class Visualizer:
     """
@@ -1275,6 +1333,18 @@ class Visualizer:
         ax2.set_aspect("equal", adjustable="datalim")
         ax2.legend()
         ax2.set_title("Experience Map (final)")
+        # Robust axis limits — protect against any residual outlier point
+        all_pts = []
+        if len(traj) > 1:
+            all_pts.append(traj[:, 1:3])
+        if gps_enu is not None:
+            all_pts.append(gps_enu)
+        if all_pts:
+            combined = np.vstack(all_pts)
+            ext = _robust_extent(combined)
+            if ext is not None:
+                ax2.set_xlim(ext[0], ext[1])
+                ax2.set_ylim(ext[2], ext[3])
         fig2.savefig(os.path.join(output_dir, "experience_map.png"), dpi=120)
         plt.close(fig2)
 
@@ -1364,10 +1434,13 @@ def build_parser() -> argparse.ArgumentParser:
                    choices=["gps_pose", "imu_yaw_gps_speed", "imu_only"],
                    default="gps_pose",
                    help=("Odometry source for CompoundHDF5DataLoader. "
-                         "gps_pose=sanity-check only (GPS→pose, Hausdorff meaningless); "
-                         "imu_yaw_gps_speed=twist [v,ω] from GPS speed + IMU yaw; "
+                         "gps_pose=sanity-check only (GPS->pose, Hausdorff meaningless); "
+                         "imu_yaw_gps_speed=twist [v,omega] from GPS speed + IMU yaw; "
                          "imu_only=twist from integrated accel (drifts without ZUPT). "
                          "Default: gps_pose"))
+    p.add_argument("--gps-max-step", type=float, default=50.0,
+                   help="Max GPS displacement (m) between consecutive valid fixes before "
+                        "teleport rejection (default: 50.0)")
 
     # HDF5 field overrides (standard multi-stream loader)
     p.add_argument("--img-key",    default=None, help="HDF5 path for images")
@@ -1392,6 +1465,8 @@ def build_parser() -> argparse.ArgumentParser:
     lv.add_argument("--vt-patch-normalise", type=int,   default=2)
     lv.add_argument("--vt-normalisation",   type=int,   default=0)
     lv.add_argument("--vt-active-decay",    type=float, default=1.0)
+    lv.add_argument("--vt-debug-sad",       action="store_true",
+                    help="Print per-frame SAD score for template matching diagnostics")
 
     # Pose Cell Network parameters
     pc = p.add_argument_group("Pose Cell Network")
@@ -1492,6 +1567,10 @@ def main() -> None:
                     unit="frame"):
 
                 exp_id = rat.step(image, odom)
+
+                if args.vt_debug_sad:
+                    print(f"[VT] frame={idx} best_sad={rat.vt.current_diff:.4f} "
+                          f"matched={rat.vt.current_id}")
 
                 # Visualise every frame (or every N in headless mode)
                 if args.headless and idx % args.save_interval != 0:
